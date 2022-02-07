@@ -4,7 +4,8 @@ library(lubridate)
 
 rm(list=ls())
 # get data #
-path_files <- c("/Users/asm8744/Desktop/DML_Data/mimic-iv-1.0/")
+# path_files <- c("/Users/asm8744/Desktop/DML_Data/mimic-iv-1.0/")
+path_files <- c("/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/mimic-iv-1.0/")
 # core data #
 admin <- read.csv(paste0(path_files,"core/admissions.csv"))
 patients <- read.csv(paste0(path_files,"core/patients.csv"))
@@ -14,36 +15,293 @@ transfers <- read.csv(paste0(path_files,"core/transfers.csv"))
 # sepsis #
 dict_diagnosis <- read.csv(paste0(path_files,"hosp/d_icd_diagnoses.csv"))
 diagnosis <- read.csv(paste0(path_files,"hosp/diagnoses_icd.csv"))
-# get all sepsis codes #
+
 sepsis_codes <- unique(as.character(unlist(dict_diagnosis %>% 
                                              filter(grepl("sepsis", long_title)) %>% 
                                              select(icd_code))))
-# get all patients that had sepsis at some point #
+# remove newborn sepsis #
+# Septicemia [sepsis] of newborn "77181"
+# Bacterial sepsis of newborn, unspecified "P36", "P368","P369"
+# Puerperal sepsis "O85","67020","67022","67024",
+
+sepsis_codes <- sepsis_codes[!(sepsis_codes %in% c("O85","67020","67022","67024","P36", "P368","P369","77181"))]
 sepsis_patients <- diagnosis %>% 
   filter(icd_code %in% sepsis_codes)
-sepsis_patients <- left_join(sepsis_patients, dict_diagnosis %>% select(icd_code, long_title), by = "icd_code")
-# write.csv(sepsis_patients, file = paste0("../DML_Data/processed_data/","sepsis_patients.csv"))
+sepsis_patients <- left_join(sepsis_patients, dict_diagnosis %>% select(icd_code, long_title), by = "icd_code") %>% 
+  select(-one_of("seq_num", "icd_version"))
 
-sepsis_patients <- sepsis_patients %>% 
-  select(subject_id, hadm_id, seq_num, long_title) %>% 
-  rename(sepsis_detail = long_title) %>% 
+# get the first time they had sepsis #
+
+admin_sepsis <- admin %>% 
+  filter(subject_id %in% sepsis_patients$subject_id,
+         hadm_id %in% sepsis_patients$hadm_id) %>% 
+  select(subject_id, hadm_id, admittime, dischtime, deathtime, insurance ,marital_status, ethnicity)
+
+sa_patients <- left_join(sepsis_patients, 
+                         admin_sepsis,
+                         by = c("subject_id","hadm_id")) %>% 
+  rowwise() %>% 
+  mutate(
+    year_adm = strsplit(admittime,"-")[[1]][1]#,
+    # year_dish = strsplit(dischtime,"-")[[1]][1],
+    # year_death = strsplit(deathtime,"-")[[1]][1],
+    # anchor_year = year_adm
+  ) 
+
+
+
+# get ventilation #
+dict_procedure <- read.csv(paste0(path_files, "hosp/d_icd_procedures.csv"))
+procedure <- read.csv(paste0(path_files, "hosp/procedures_icd.csv"))
+
+vent_codes <- unique(as.character(unlist(dict_procedure %>% 
+                                           filter(grepl("ventilation", long_title)) %>% 
+                                           select(icd_code))))
+# merge ventilation events with sepsis patients #
+merge_procedure <- procedure %>% 
+  filter(icd_code %in% vent_codes,
+         subject_id %in% sepsis_patients$subject_id,
+         hadm_id %in% sepsis_patients$hadm_id) %>% 
+  select(subject_id, hadm_id, icd_code,chartdate)
+
+
+merge_procedure_name <- left_join(merge_procedure, dict_procedure %>% select(icd_code, long_title), by = "icd_code") %>% 
+  select(-one_of("icd_code")) %>% rename(ventilation_detail = long_title)
+
+
+sav_patients <- left_join(sa_patients,
+                          merge_procedure_name,
+                          by = c("subject_id", "hadm_id"))
+# add age #
+sav_patients <- left_join(sav_patients, 
+                          patients %>% select(subject_id, anchor_age, anchor_year),
+                          by = "subject_id"
+) %>% 
+  mutate(
+    age = anchor_age + (as.numeric(year_adm) - as.numeric(anchor_year))
+  )
+
+
+
+# sav_patients <- left_join(sav_patients %>% 
+#             mutate(anchor_year = as.numeric(anchor_year)), 
+#           patients, 
+#           by = c("subject_id", "anchor_year") ) 
+
+# keep first sepsis event #
+sav_patients_first_sepsis <- sav_patients %>% 
+  mutate(ventilation = ifelse(is.na(ventilation_detail),0, 1)) %>% 
+  group_by(subject_id) %>% 
+  mutate(admin_time_stamp = min(admittime)#,
+         # vent_time_stamp = min(chartdate)
+  ) %>% 
+  ungroup() %>% 
+  filter(admittime == admin_time_stamp#,
+         # chartdate == vent_time_stamp
+  ) %>% 
+  select(subject_id, hadm_id, ventilation, chartdate, admittime, dischtime, deathtime,age) %>% 
   distinct()
 
-# what to do with multiple assessement of sepsis? #
-# sepsis_patients %>% 
-#   group_by(subject_id, hadm_id) %>% 
-#   tally() %>% 
-#   arrange(-n)
+## still duplicates from ventilation ##
+sav_patients_novent <- sav_patients_first_sepsis %>% filter(ventilation == 0)
+sav_patients_vent <- sav_patients_first_sepsis %>% filter(ventilation == 1)
 
-###########################################
-# add transfers (not sure how we want to deal with these patients) #
+sav_patients_vent_uniq <- sav_patients_vent %>% 
+  group_by(subject_id) %>% 
+  mutate(vent_time_stamp = min(chartdate)
+  ) %>% 
+  ungroup() %>% 
+  filter(chartdate == vent_time_stamp
+  ) %>% 
+  select(subject_id, hadm_id, ventilation, chartdate, admittime, dischtime, deathtime,age) %>% 
+  distinct()
 
-# sepsis_patients <- left_join(sepsis_patients,
-#                              transfers %>% select(subject_id, transfer_id, eventtype),
-#                              by = "subject_id")
+sav_patients_first <- rbind(sav_patients_novent,sav_patients_vent_uniq)
 
-###########################################
-# get ventilation events #
+sav_patients_first_d <- sav_patients_first #%>% 
+# rowwise() %>% 
+# mutate(
+#   chartdate = ifelse(!is.na(chartdate),paste(chartdate, "12:00:00"), chartdate),
+#   time = ifelse(ventilation == 1 & deathtime != "", 
+#                 difftime(deathtime,chartdate, units = 'hours' ),
+#                 NA
+#   ),
+#   death_40H = ifelse(is.na(time), 0, 
+#                      ifelse(time <= 40, 1, 0)
+#   ),
+#   death_60H = ifelse(is.na(time), 0, 
+#                      ifelse(time <= 60, 1, 0)
+#   ),
+#   death_80H = ifelse(is.na(time), 0, 
+#                      ifelse(time <= 80, 1, 0)
+#   )
+# )
+
+### add icu entry ###
+icustay <- read.csv(paste0(path_files,"icu/icustays.csv"))
+sav_patients_first_d_icu <- left_join(
+  sav_patients_first_d,
+  icustay %>% select(subject_id,hadm_id, intime,outtime),
+  by = c("subject_id", "hadm_id")
+)
+
+sav_patients_first_d <- sav_patients_first_d_icu %>% 
+  group_by(subject_id) %>% 
+  mutate(intime_stamp = min(intime)#,
+         # vent_time_stamp = min(chartdate)
+  ) %>% 
+  ungroup() %>% 
+  filter(intime == intime_stamp
+  ) %>% 
+  distinct()
+
+#### add demographics #####
+# sex/gender #
+sav_patients_first_d_d <- left_join(sav_patients_first_d ,
+                                    patients %>% select(subject_id, gender),
+                                    by = "subject_id")
+
+# others #
+sav_patients_first_d_d <- left_join(sav_patients_first_d_d, 
+                                    admin %>% 
+                                      select(subject_id,hadm_id,insurance, language, marital_status, ethnicity),
+                                    by = c("subject_id", "hadm_id"))
+
+# write.csv(sav_patients_first_d_d, "/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/data/vent_time.csv")
+# zeqi_data <- sav_patients_first_d_d %>% 
+#   select(subject_id, hadm_id, ventilation, chartdate, intime) %>% 
+#   mutate(time_stamp = ifelse(ventilation == 1, chartdate, intime))
+# write.csv(zeqi_data, "/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/data/vzeqi_data.csv")
+
+# recreate outcome #
+
+savdd_outcome <- sav_patients_first_d_d %>% 
+  rowwise() %>% 
+  mutate(
+    time = as.numeric(ifelse(ventilation == 1 & deathtime != "", 
+                             difftime(deathtime,chartdate, units = 'hours' ),
+                             ifelse(deathtime != "",
+                                    difftime(deathtime,intime, units = 'hours' ),
+                                    difftime(outtime,intime, units = 'hours' )
+                             )
+    )),
+    death_40H = ifelse(time <= 40, 1, 0),
+    death_60H = ifelse(time <= 60, 1, 0),
+    death_80H = ifelse(time <= 80, 1, 0),
+    death_100H = ifelse(time <= 100, 1, 0),
+    death_120H = ifelse(time <= 120, 1, 0)
+  )
+
+### summary ###
+
+sav_patients_first_d_d %>% 
+  mutate(
+    ventilation = ifelse(ventilation == 1, "yes","no")
+  ) %>% 
+  select(ventilation, age, gender, insurance, language, marital_status, 
+         ethnicity, death_40H, death_60H, death_80H) %>% 
+  tbl_summary(by = ventilation)
+
+### fix data to numeric ###
+final <- sav_patients_first_d_d %>% 
+  select(ventilation,age, gender, insurance, language, marital_status, ethnicity, death_40H, death_60H, death_80H) %>% 
+  mutate(
+    # gender #
+    gender = ifelse(gender == "F", 0, 1),
+    # insurance #
+    medicaid = ifelse(insurance == "Medicaid",1,0),
+    medicare = ifelse(insurance == "Medicare",1,0),
+    # language #
+    language = ifelse(language == "ENGLISH",1,0),
+    # martial status #
+    divorced = ifelse(marital_status == "DIVORCED", 1, 0),
+    married = ifelse(marital_status == "MARRIED", 1, 0),
+    single = ifelse(marital_status == "SINGLE", 1, 0),
+    widowed = ifelse(marital_status == "WIDOWED", 1, 0),
+    # ethinicty #
+    native = ifelse(ethnicity == "AMERICAN INDIAN/ALASKA NATIVE", 1, 0),
+    asian = ifelse(ethnicity == "ASIAN", 1, 0),
+    afro_american = ifelse(ethnicity == "BLACK/AFRICAN AMERICAN", 1, 0),
+    hispanic = ifelse(ethnicity == "HISPANIC/LATINO", 1, 0),
+    other = ifelse(ethnicity == "OTHER", 1, 0),
+    white = ifelse(ethnicity == "WHITE", 1, 0)
+  ) %>% 
+  select(-one_of(c("insurance","marital_status", "ethnicity")))
+
+final %>% 
+  tbl_summary(by = ventilation)
+
+write.csv(final, "/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/data/analysis_set.csv")
+###################################
+
+
+##################################
+
+
+sav_patients_first_d <- sav_patients_first %>% 
+  rowwise() %>% 
+  mutate(
+    time = ifelse(ventilation == 1 & deathtime != "", 
+                  difftime(deathtimechartdate, units = 'hours' ),
+                  NA
+    ),
+    death_40H = ifelse(is.na(time), 0, 
+                       ifelse(time <= 40, 1, 0)
+    ),
+    death_60H = ifelse(is.na(time), 0, 
+                       ifelse(time <= 60, 1, 0)
+    ),
+    death_80H = ifelse(is.na(time), 0, 
+                       ifelse(time <= 80, 1, 0)
+    )
+  )
+
+
+difftime(sav_patients_first$dischtime[1],sav_patients_first$admittime[1], units = 'hours' )
+
+difftime("2128-09-08 15:13:00","2128-09-08 11:13:00", units = 'hours' )
+
+
+sav_patients_first$dischtime[1]
+
+as_date(sav_patients_first$dischtime[1]) - 
+  as_date(sav_patients_first$admittime[1] )
+
+dups <- sav_patients_first$subject_id[duplicated(sav_patients_first$subject_id)]
+
+########################################################
+
+
+
+dups <- sav_patients_first_sepsis$subject_id[duplicated(sav_patients_first_sepsis$subject_id)]
+
+sav_patients_first_sepsis %>% filter(subject_id == "11281568") %>% 
+  select(subject_id, admittime, ventilation_detail, chartdate)
+sav_patients %>% filter(subject_id == "11281568") %>% 
+  select(subject_id, admittime, ventilation_detail, chartdate)
+
+sav_patients_first_sepsis %>% filter(subject_id == "19509298") %>% 
+  select(subject_id, admittime, ventilation_detail, chartdate)
+sav_patients %>% filter(subject_id == "19509298") %>% 
+  select(subject_id, admittime, ventilation_detail, chartdate)
+
+filter(admittime == time_stamp) %>% 
+  ungroup()
+
+# subset to their first sepsis event? #
+# subset to their first ventilation event? #
+
+
+
+
+#########################################
+
+# get age of patients #
+saa_patients <- left_join(sa_patients,
+                          patients,
+                          by = "subject_id")
+
+# ventilation data #
 dict_procedure <- read.csv(paste0(path_files, "hosp/d_icd_procedures.csv"))
 procedure <- read.csv(paste0(path_files, "hosp/procedures_icd.csv"))
 
@@ -60,81 +318,8 @@ merge_procedure <- procedure %>%
 
 merge_procedure_name <- left_join(merge_procedure, dict_procedure %>% select(icd_code, long_title), by = "icd_code") %>% 
   select(-one_of("icd_code")) %>% rename(ventilation_detail = long_title)
-# length(unique(merge_procedure_name$subject_id))
-# 2519 patients received ventilation at some point #
-
-sv_patients <- full_join(sepsis_patients,
-                         merge_procedure_name,
-                         by = c("subject_id", "hadm_id"))
-# checks #
-# dim(sv_patients)
-# length(unique(as.character(unlist(sv_patients %>% filter(!is.na(ventilation_detail)) %>% select(subject_id)))))
-# 2519 --> match #
-
-# fix data, propose treatments, summarise #
-sv_data <- sv_patients %>% 
-  mutate(ventilation_detail = ifelse(is.na(ventilation_detail), "None", ventilation_detail))
-
-# get number of patients with multiple entries #
-sv_data %>% 
-  group_by(subject_id) %>% 
-  tally(name = "data_entries") %>% 
-  ungroup() %>% 
-  group_by(data_entries) %>% 
-  tally(name = "num_patients")
-
-sv_data %>% 
-  group_by(subject_id) %>% 
-  tally(name = "data_entries") %>% 
-  ungroup() %>% arrange(-data_entries)
-
-sv_data %>% filter(subject_id == "11281568")
-procedure %>% filter(subject_id == "11281568")
-
-sv_data %>% filter(subject_id == "19509298")
-procedure %>% filter(subject_id == "19509298")
-
-sv_data %>% 
-  select(sepsis_detail, ventilation_detail) %>% 
-  tbl_summary()
-
-#################################################
-### CONFOUNDERS ###
-
-#################################################
-### OUTCOMES ###
-admin_sv <- admin %>% 
-  filter(subject_id %in% sv_data$subject_id,
-         hadm_id %in% sv_data$hadm_id) %>% 
-  select(subject_id, hadm_id, admittime, dischtime, deathtime, insurance, ethnicity) %>% 
-  mutate(
-    status = ifelse(deathtime != "", 1, 0), 
-    time = ifelse(status == 1,
-                  as.numeric(as.Date(deathtime) - as.Date(admittime)),
-                  as.numeric(as.Date(dischtime) - as.Date(admittime))),
-  )
 
 
-
-
-
-
-
-
-#################################################
-
-temp <- procedure %>%
-  filter(icd_code %in% vent_codes, subject_id %in% sepsis_patients$subject_id)
-
-sv_patients <- left_join(sepsis_patients %>% 
-                           rename(icd_code_sepsis = icd_code, icd_version_sepsis = icd_version), 
-                         merge_procedure, 
-                         by = c("subject_id", "hadm_id", "seq_num"))
-
-sv_patients <- full_join(sepsis_patients %>% 
-                           rename(icd_code_sepsis = icd_code, icd_version_sepsis = icd_version), 
-                         merge_procedure, 
-                         by = c("subject_id", "hadm_id", "seq_num"))
-
-###########################################
-# add demographics & time outcomes #
+saav_patients <- left_join(saa_patients,
+                           merge_procedure_name,
+                           by = c("subject_id", "hadm_id"))
