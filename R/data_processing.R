@@ -1,6 +1,7 @@
 library(tidyverse)
 library(gtsummary)
 library(lubridate)
+library(mice)
 
 rm(list=ls())
 # get data #
@@ -48,8 +49,251 @@ sa_patients <- left_join(sepsis_patients,
     # anchor_year = year_adm
   ) 
 
+# keep first sepsis event #
+sav_patients_first_sepsis <- admin_sepsis %>% 
+  group_by(subject_id) %>% 
+  mutate(admin_time_stamp = min(admittime)
+  ) %>% 
+  ungroup() %>% 
+  filter(admittime == admin_time_stamp
+  ) %>% 
+  # select(subject_id, hadm_id, admittime, dischtime, deathtime) %>% 
+  distinct()
+
+#### Adding ICU times ####
+icustay <- read.csv(paste0(path_files,"icu/icustays.csv"))
+sav_patients_first_d_icu <- left_join(
+  sav_patients_first_sepsis,
+  icustay %>% select(subject_id,hadm_id,stay_id, intime,outtime),
+  by = c("subject_id", "hadm_id")
+)
+
+sav_patients_first_d <- sav_patients_first_d_icu %>% 
+  group_by(subject_id) %>% 
+  mutate(intime_stamp = min(intime)
+  ) %>% 
+  ungroup() %>% 
+  filter(intime == intime_stamp
+  ) %>% 
+  distinct()
+
+#### adding ICU ventilation times #####
+t1 <- read.table(paste0(path_files,"icu/ventilation_icu_1.txt"), sep= ",")
+t2 <- read.table(paste0(path_files,"icu/ventilation_icu_2.txt"), sep= ",")
+
+icu_vent <- rbind(t1,t2)
+colnames(icu_vent) <- c("subject_id","hadm_id","stay_id","charttime",
+                        "storetime","itemid","value","valuenum","valueuom","warning")
+
+icu_vent_sepsis <- icu_vent %>% 
+  filter(subject_id %in% sav_patients_first_d$subject_id,
+         hadm_id %in% sav_patients_first_d$hadm_id,
+         itemid %in% c("223848" ,"223849")) %>% 
+  select(subject_id, hadm_id, charttime,storetime)
+
+# merge with data #
+savdd_outcome_icu <- left_join(
+  sav_patients_first_d, 
+  icu_vent_sepsis,
+  by = c("subject_id", "hadm_id")
+) %>% 
+  mutate(ventilation = ifelse(is.na(charttime),0,1))
+
+# keep first time of ventilation for those who had it #
+no_vent_patients <- savdd_outcome_icu %>% 
+  filter(ventilation == 0)
+vent_patients <- savdd_outcome_icu %>% 
+  filter(ventilation == 1)
 
 
+vent_patients_uniq <- vent_patients %>% 
+  group_by(subject_id) %>% 
+  mutate(vent_time_stamp = min(charttime)
+  ) %>% 
+  ungroup() %>% 
+  filter(charttime == vent_time_stamp
+  ) %>% 
+  select(-one_of("vent_time_stamp")) %>% 
+  distinct()
+
+sav_patients_first <- rbind(no_vent_patients,vent_patients_uniq)
+
+sav_patients_first_d <- sav_patients_first
+
+# data for zeqi #
+# zeqi_data <- sav_patients_first_d %>%
+#   select(subject_id, hadm_id, ventilation, charttime, intime) %>%
+#   mutate(time_stamp = ifelse(ventilation == 1, charttime, intime)) 
+# write.csv(zeqi_data, "/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/data/vzeqi_data.csv")
+
+
+#### Adding Covariates ####
+# time fixed confounders #
+# sex/gender + age #
+sav_patients_first_d_d <- left_join(sav_patients_first_d ,
+                                    patients %>% select(subject_id, gender, anchor_age, anchor_year),
+                                    by = "subject_id") %>% 
+  rowwise()%>% 
+  mutate(
+    year_adm = strsplit(admittime, "-")[[1]][1],
+    age = anchor_age + (as.numeric(year_adm) - as.numeric(anchor_year))
+  )
+
+
+
+# time varying #
+# these are in the ed folder #
+
+triage <- read.csv("/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/mimic-iv-1.0/mimic-iv-ed-1.0/ed/triage.csv")
+edstay <- read.csv("/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/mimic-iv-1.0/mimic-iv-ed-1.0/ed/edstays.csv")
+
+
+# get hadmid for triage #
+triage_hadmid <- left_join(triage,
+                           edstay %>% select(subject_id, hadm_id, stay_id,intime,outtime) %>% 
+                             rename(intime_ed = intime, outtime_ed = outtime),
+                           by = c("subject_id","stay_id"))
+
+temp <- triage_hadmid %>% filter(subject_id %in% sav_patients_first_d_d$subject_id,
+                                 hadm_id %in% sav_patients_first_d_d$hadm_id)
+
+# sum(unique(triage$subject_id) %in% sav_patients_first_d_d$subject_id)
+# sum(unique(temp$hadm_id) %in% sav_patients_first_d_d$hadm_id) # 4314
+# 
+# apply(temp, 2, function(x){sum(!is.na(x))})
+
+# merge #
+sav_patients_first_d_d_t <- left_join(
+  sav_patients_first_d_d,
+  temp %>% 
+    select(subject_id, hadm_id, temperature,
+           heartrate, resprate, o2sat, sbp, dbp, pain, acuity,intime_ed,outtime_ed),
+  by = c("subject_id","hadm_id")
+)
+
+# get the closest obs for these before start time #
+sav_patients_first_d_d_t_uniq <-
+  sav_patients_first_d_d_t %>%
+  group_by(subject_id) %>%
+  mutate(time_diff = ifelse(
+    ventilation == 1,
+    difftime(charttime,intime_ed, units = 'hours'),
+    difftime(intime,intime_ed, units = 'hours')
+  ),
+  ed_time_stamp = min(time_diff)
+  ) %>%
+  ungroup() 
+
+sav_patients_first_d_d_t_uniq_1 <- sav_patients_first_d_d_t_uniq %>% 
+  filter(is.na(ed_time_stamp))
+sav_patients_first_d_d_t_uniq_2 <- sav_patients_first_d_d_t_uniq %>%
+  filter(!is.na(ed_time_stamp),
+         time_diff == ed_time_stamp)
+
+sav_patients_first_d_d_t <- rbind(
+  sav_patients_first_d_d_t_uniq_1,
+  sav_patients_first_d_d_t_uniq_2
+) %>% 
+  select(-one_of("stay_id","storetime", "anchor_age","anchor_year","year_adm",
+                 "intime_ed","outtime_ed","time_diff","ed_time_stamp")) %>% 
+  distinct()
+
+#### outcomes ####
+savdd_outcome <- sav_patients_first_d_d_t %>% 
+  rowwise() %>% 
+  mutate(
+    time = as.numeric(ifelse(ventilation == 1 & deathtime != "", 
+                             difftime(deathtime,charttime, units = 'hours' ),
+                             ifelse(deathtime != "",
+                                    difftime(deathtime,intime, units = 'hours' ),
+                                    difftime(outtime,intime, units = 'hours' )
+                             )
+    )),
+    death_40H = ifelse(time <= 40, 1, 0),
+    death_60H = ifelse(time <= 60, 1, 0),
+    death_80H = ifelse(time <= 80, 1, 0),
+    death_100H = ifelse(time <= 100, 1, 0),
+    death_120H = ifelse(time <= 120, 1, 0)
+  )
+
+
+
+#######
+#### summary ####
+
+savdd_outcome %>% 
+  mutate(
+    ventilation = ifelse(ventilation == 1, "yes","no")
+  ) %>% 
+  select(ventilation,temperature,
+         heartrate, resprate, o2sat, sbp, dbp, pain, acuity) %>% 
+  tbl_summary(by = ventilation)
+
+
+savdd_outcome %>% 
+  mutate(
+    ventilation = ifelse(ventilation == 1, "yes","no")
+  ) %>% 
+  select(ventilation, age, gender, insurance, 
+         ethnicity, death_40H, death_60H, death_80H,death_100H, death_120H,temperature,
+         heartrate, resprate, o2sat, sbp, dbp, pain, acuity) %>% 
+  tbl_summary(by = ventilation)
+
+### fix data to numeric ###
+final <- savdd_outcome %>% 
+  select(subject_id,hadm_id,ventilation,age, gender, insurance, ethnicity, temperature,
+         heartrate, resprate, o2sat, sbp, dbp, pain, acuity,
+         death_40H, death_60H, death_80H,death_100H, death_120H) %>% 
+  mutate(
+    # gender #
+    gender = ifelse(gender == "F", 0, 1),
+    # insurance #
+    medicaid = ifelse(insurance == "Medicaid",1,0),
+    medicare = ifelse(insurance == "Medicare",1,0),
+    # martial status #
+    # divorced = ifelse(marital_status == "DIVORCED", 1, 0),
+    # married = ifelse(marital_status == "MARRIED", 1, 0),
+    # single = ifelse(marital_status == "SINGLE", 1, 0),
+    # widowed = ifelse(marital_status == "WIDOWED", 1, 0),
+    # ethinicty #
+    native = ifelse(ethnicity == "AMERICAN INDIAN/ALASKA NATIVE", 1, 0),
+    asian = ifelse(ethnicity == "ASIAN", 1, 0),
+    afro_american = ifelse(ethnicity == "BLACK/AFRICAN AMERICAN", 1, 0),
+    hispanic = ifelse(ethnicity == "HISPANIC/LATINO", 1, 0),
+    other = ifelse(ethnicity == "OTHER", 1, 0),
+    white = ifelse(ethnicity == "WHITE", 1, 0)
+  ) %>% 
+  select(-one_of(c("insurance",#"marital_status",
+                   "ethnicity")))
+
+final %>% 
+  tbl_summary(by = ventilation)
+
+write.csv(final, "/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/data/analysis_set.csv")
+
+### Impute missing data ###
+md.pattern(final)
+tempData <- mice(final[,-c(1,2)],m=5,maxit=50,seed=500)
+completedData <- complete(tempData,1)
+
+final_imp <- cbind(final[, 1:2],completedData)
+anyNA(final_imp)
+
+final_imp %>% 
+  tbl_summary(by = ventilation)
+write.csv(final_imp, "/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/data/imp_analysis_set.csv")
+dim(final[complete.cases(final),])
+
+
+##################################################
+
+
+
+##################################################
+
+
+
+##################################################
 # get ventilation #
 dict_procedure <- read.csv(paste0(path_files, "hosp/d_icd_procedures.csv"))
 procedure <- read.csv(paste0(path_files, "hosp/procedures_icd.csv"))
@@ -192,6 +436,57 @@ savdd_outcome <- sav_patients_first_d_d %>%
     death_120H = ifelse(time <= 120, 1, 0)
   )
 
+timedifference <- difftime(savdd_outcome$intime,savdd_outcome$chartdate , units = 'hours' )
+timedifference <- as.numeric(timedifference[!is.na(timedifference)])
+hist(timedifference)
+summary(timedifference)
+quantile(timedifference, c(0.01, 0.05, 0.10, 0.25,0.5, 0.75, 0.9, 0.95, 0.99))
+
+#### adding ICU ventilation times #####
+t1 <- read.table(paste0(path_files,"icu/ventilation_icu_1.txt"), sep= ",")
+t2 <- read.table(paste0(path_files,"icu/ventilation_icu_2.txt"), sep= ",")
+
+icu_vent <- rbind(t1,t2)
+colnames(icu_vent) <- c("subject_id","hadm_id","stay_id","charttime",
+                        "storetime","itemid","value","valuenum","valueuom","warning")
+
+icu_vent_sepsis <- icu_vent %>% 
+  filter(subject_id %in% savdd_outcome$subject_id,
+         hadm_id %in% savdd_outcome$hadm_id,
+         itemid %in% c("223848" ,"223849")) %>% 
+  select(subject_id, hadm_id, charttime,storetime)
+
+# merge with data #
+savdd_outcome_icu <- left_join(
+  savdd_outcome, 
+  icu_vent_sepsis,
+  by = c("subject_id", "hadm_id")
+)
+
+temp_dat <- savdd_outcome_icu %>% 
+  mutate(temp_time = as.numeric(difftime(intime,charttime , units = 'hours' ))) %>% 
+  filter(temp_time > 0)
+
+
+
+
+
+
+
+
+d_items <- read.csv(paste0(path_files,"icu/d_items.csv"))
+vent_codes_icu <- unique(as.character(unlist(d_items %>% 
+                                           filter(grepl("Ventilator", label)) %>% 
+                                           select(itemid))))
+vent_codes_icu <- c("223848" ,"223849")
+icu_procedures <- read.csv(paste0(path_files,"icu/procedureevents.csv"))
+icu_chartevents <- read.csv(paste0(path_files,"icu/chartevents.csv"))
+
+
+icu_procedures %>% 
+  filter(subject_id %in% savdd_outcome$subject_id,
+         itemid %in% vent_codes_icu)
+
 ### summary ###
 
 sav_patients_first_d_d %>% 
@@ -233,6 +528,22 @@ final %>%
 
 write.csv(final, "/Users/axel/Desktop/NYU/Rotation2/DML/MIMIC_Data/data/analysis_set.csv")
 ###################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 ##################################
